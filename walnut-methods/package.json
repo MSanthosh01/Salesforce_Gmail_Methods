@@ -4,7 +4,8 @@
   "description": "Walnut custom automation methods",
   "private": true,
   "dependencies": {
-    "googleapis": "^144.0.0"
+    "googleapis": "^144.0.0",
+    "open": "^10.1.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

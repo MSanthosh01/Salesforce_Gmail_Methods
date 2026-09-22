@@ -1,140 +1,122 @@
 import type { WalnutBaseContext } from './walnut';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as http from 'http';
+import * as url from 'url';
 import { google } from 'googleapis';
 import type { Auth } from 'googleapis';
 
 /** @walnut_method
- * name: Read OTP from Gmail Using Json Credentials File
- * description: Fetch the latest otp from gmail using credentials at ${credentialFilePath} and store in $[OTP]
+ * name: Read OTP from Gmail
+ * description: Fetch the latest otp from gmail using client secret ${clientSecretPath} and token ${tokenPath} and store in $[OTP]
  * actionType: custom_read_otp_gmail
  * context: shared
  * needsLocator: false
  * category: Email Automation
  */
 export async function readOtpFromGmail(ctx: WalnutBaseContext) {
-  // ctx.args[0] = credentialFilePath  (from ${credentialFilePath})
-  // ctx.args[1] = "OTP"               (variable name from $[OTP])
+  // ctx.args[0] = clientSecretPath  — local path OR Walnut artifact name/ID
+  //                                    e.g. "C:\...\client_secret.json"  or  "gmail-client-secret"
+  // ctx.args[1] = tokenPath          — local path OR Walnut artifact name/ID for token.json
+  //                                    e.g. "C:\...\token.json"          or  "gmail-token"
+  //                                    Leave empty on first local run → browser consent auto-launches
+  //                                    and token.json is saved beside client_secret.json
+  // ctx.args[2] = "OTP"             — runtime variable name from $[OTP]
 
-  const credentialFilePath: string = ctx.args[0];
-  const outputVar: string = ctx.args[1];
+  const clientSecretPath: string = ctx.args[0];
+  const tokenPathArg: string     = ctx.args[1];   // may be empty string on first local run
+  const outputVar: string        = ctx.args[2];
 
-  if (!credentialFilePath) {
-    throw new Error('credentialFilePath is required — pass the path to your Google service-account or OAuth2 JSON file.');
+  if (!clientSecretPath) {
+    throw new Error(
+      'clientSecretPath is required — pass a local path or Walnut artifact name ' +
+      'for the OAuth2 client secrets JSON downloaded from Google Cloud Console.'
+    );
   }
   if (!outputVar) {
     throw new Error('Output variable name is required — ensure $[OTP] is present in the step description.');
   }
 
-  // ── 1. Load & validate credential file ────────────────────────────────────
-  // Detect whether the input is a local file path or a Walnut artifact reference:
-  //   • If the path exists on disk (absolute or relative) → use it directly
-  //   • Otherwise → treat it as a Walnut artifact name/ID and resolve via ctx.resolveArtifact
-  ctx.log(`Resolving credential source: "${credentialFilePath}"`);
+  // ── 1. Resolve client secret (local path or Walnut artifact) ──────────────
+  const clientSecretResolved = await resolveFile(ctx, clientSecretPath, 'client secret');
+  const rawClientSecret      = JSON.parse(fs.readFileSync(clientSecretResolved, 'utf-8'));
 
-  const localPath = path.isAbsolute(credentialFilePath)
-    ? credentialFilePath
-    : path.resolve(process.cwd(), credentialFilePath);
-
-  let resolvedPath: string;
-  if (fs.existsSync(localPath)) {
-    resolvedPath = localPath;
-    ctx.log(`Using local file: ${resolvedPath}`);
-  } else {
-    ctx.log(`Local file not found — treating as Walnut artifact: "${credentialFilePath}"`);
-    resolvedPath = await ctx.resolveArtifact(credentialFilePath);
-    ctx.log(`Artifact resolved to: ${resolvedPath}`);
-  }
-
-  if (!fs.existsSync(resolvedPath)) {
+  const oauthCreds = rawClientSecret.installed ?? rawClientSecret.web;
+  if (!oauthCreds) {
     throw new Error(
-      `Credential file not found: "${credentialFilePath}"\n` +
-      'Provide either a valid local file path or a Walnut artifact name/ID.'
+      'clientSecretPath does not look like an OAuth2 client secrets file. ' +
+      'Expected a JSON with an "installed" or "web" key from Google Cloud Console.'
     );
   }
 
-  const rawCreds = JSON.parse(fs.readFileSync(resolvedPath, 'utf-8'));
-
-  // ── 2. Log Google Cloud project from credential file ──────────────────────
-  // The project_id is embedded in every service-account and OAuth2 JSON —
-  // no separate Google Cloud project input is needed.
   const projectId: string | undefined =
-    rawCreds.project_id ||
-    rawCreds.quota_project_id ||
-    (rawCreds.installed || rawCreds.web)?.project_id;
+    rawClientSecret.project_id ?? rawClientSecret.quota_project_id ?? oauthCreds.project_id;
 
-  if (projectId) {
-    ctx.log(`Google Cloud Project: ${projectId}`);
+  ctx.log(`Google Cloud Project: ${projectId ?? '(not found in file)'}`);
+  ctx.log(`OAuth2 client_id: ${oauthCreds.client_id}`);
+
+  // ── 2. Determine token.json path ──────────────────────────────────────────
+  // Priority:
+  //   1. ${tokenPath} arg in step description — local path OR Walnut artifact name/ID
+  //   2. token.json beside client_secret.json — default / first-run save location
+  let tokenFilePath: string;
+
+  if (tokenPathArg) {
+    // User supplied a path or artifact name — resolve it
+    tokenFilePath = await resolveFile(ctx, tokenPathArg, 'token');
   } else {
-    ctx.warn('project_id not found in credential file — proceeding anyway.');
+    // Not supplied — default to beside the client secret file
+    tokenFilePath = path.join(path.dirname(clientSecretResolved), 'token.json');
+    ctx.log(`token: defaulting to ${tokenFilePath}`);
   }
 
-  // ── 3. Authenticate ────────────────────────────────────────────────────────
-  let auth: Auth.GoogleAuth | Auth.OAuth2Client;
+  // ── 3. Obtain OAuth2 tokens — auto-browser on first run ───────────────────
+  const oAuth2Client: Auth.OAuth2Client = new google.auth.OAuth2(
+    oauthCreds.client_id,
+    oauthCreds.client_secret,
+    'http://localhost'            // redirect_uri — overridden per-flow below
+  );
 
-  if (rawCreds.type === 'service_account') {
-    // Service Account — requires Gmail domain-wide delegation with readonly scope
-    auth = new google.auth.GoogleAuth({
-      credentials: rawCreds,
-      scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
-      ...(projectId ? { projectId } : {}),
+  if (fs.existsSync(tokenFilePath)) {
+    // ── Subsequent runs: load saved token ──────────────────────────────────
+    const savedToken = JSON.parse(fs.readFileSync(tokenFilePath, 'utf-8'));
+    oAuth2Client.setCredentials(savedToken);
+    ctx.log(`Token loaded from: ${tokenFilePath}`);
+
+    // Auto-save refreshed tokens back to the same file
+    oAuth2Client.on('tokens', (tokens) => {
+      const merged = { ...savedToken, ...tokens };
+      try {
+        fs.writeFileSync(tokenFilePath, JSON.stringify(merged, null, 2));
+        ctx.log('Token auto-refreshed and saved: ' + tokenFilePath);
+      } catch {
+        ctx.warn('Token refreshed but could not be saved back (read-only path — expected on cloud).');
+      }
     });
-    ctx.log(`Authenticating with Service Account: ${rawCreds.client_email}`);
-
-  } else if (rawCreds.installed || rawCreds.web) {
-    // OAuth2 client secrets file — needs a token.json alongside it
-    const oauthCreds = rawCreds.installed ?? rawCreds.web;
-    const oAuth2Client = new google.auth.OAuth2(
-      oauthCreds.client_id,
-      oauthCreds.client_secret,
-      oauthCreds.redirect_uris[0]
-    );
-
-    const tokenPath = path.join(path.dirname(resolvedPath), 'token.json');
-    if (!fs.existsSync(tokenPath)) {
-      throw new Error(
-        `OAuth2 token file not found at: ${tokenPath}\n` +
-        'Run the OAuth2 consent flow once to generate token.json, ' +
-        'then place it beside your credentials file.'
-      );
-    }
-    oAuth2Client.setCredentials(JSON.parse(fs.readFileSync(tokenPath, 'utf-8')));
-    auth = oAuth2Client;
-    ctx.log('Authenticating with OAuth2 client secrets + token.json');
-
-  } else if (rawCreds.access_token || rawCreds.refresh_token) {
-    // Pre-generated token JSON with client_id / client_secret embedded
-    const oAuth2Client = new google.auth.OAuth2(
-      rawCreds.client_id,
-      rawCreds.client_secret
-    );
-    oAuth2Client.setCredentials(rawCreds);
-    auth = oAuth2Client;
-    ctx.log('Authenticating with pre-generated OAuth2 token.');
 
   } else {
-    throw new Error(
-      'Unrecognised credential file format. ' +
-      'Supported: service_account JSON, OAuth2 client-secrets JSON (+ token.json), ' +
-      'or a token JSON with access_token / refresh_token.'
-    );
+    // ── First run: launch browser for consent, wait for redirect ───────────
+    ctx.log('No token.json found — starting OAuth2 browser consent flow...');
+    const tokens = await runLocalOAuthFlow(ctx, oauthCreds);
+    fs.writeFileSync(tokenFilePath, JSON.stringify(tokens, null, 2));
+    ctx.log(`token.json saved to: ${tokenFilePath}`);
+    oAuth2Client.setCredentials(tokens);
   }
 
-  // ── 4. Query Gmail — default OTP-related keywords, no user input needed ───
-  //
-  // Internal default: search the inbox for messages containing common OTP
-  // keywords received within the last 10 minutes to avoid stale codes.
-  // No subject argument is accepted from the test step — this is intentional.
-  const tenMinutesAgo = Math.floor((Date.now() - 10 * 60 * 1000) / 1000);
+  // ── 4. Query Gmail — OTP keyword filter (last 10 min), fallback 30 min ───
+  ctx.log('OAuth2 client ready. Querying Gmail...');
+  const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
+
+  const tenMinutesAgo    = Math.floor((Date.now() - 10 * 60 * 1000) / 1000);
+  const thirtyMinutesAgo = Math.floor((Date.now() - 30 * 60 * 1000) / 1000);
+
   const defaultQuery =
     `in:inbox after:${tenMinutesAgo} ` +
     `(subject:OTP OR subject:"one-time" OR subject:"verification code" ` +
     `OR subject:"passcode" OR subject:"your code" OR subject:"security code" ` +
     `OR subject:"login code" OR subject:"signin code")`;
 
-  ctx.log(`Searching Gmail with default OTP query (last 10 min): ${defaultQuery}`);
-
-  const gmail = google.gmail({ version: 'v1', auth });
+  ctx.log(`Searching Gmail (last 10 min, OTP keywords): ${defaultQuery}`);
 
   const listResponse = await gmail.users.messages.list({
     userId: 'me',
@@ -144,12 +126,9 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
 
   let messages = listResponse.data.messages;
 
-  // Fallback: broaden search to last 30 min without subject filter
   if (!messages || messages.length === 0) {
-    const thirtyMinutesAgo = Math.floor((Date.now() - 30 * 60 * 1000) / 1000);
     const fallbackQuery = `in:inbox after:${thirtyMinutesAgo}`;
-    ctx.warn(`No OTP emails found with keyword filter. Falling back to: ${fallbackQuery}`);
-
+    ctx.warn(`No OTP keyword match. Falling back to all inbox mail (last 30 min): ${fallbackQuery}`);
     const fallbackResponse = await gmail.users.messages.list({
       userId: 'me',
       q: fallbackQuery,
@@ -159,29 +138,25 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   }
 
   if (!messages || messages.length === 0) {
-    throw new Error('No recent emails found in Gmail inbox (last 30 minutes). Cannot extract OTP.');
+    throw new Error(
+      'No recent emails found in Gmail inbox (last 30 minutes). ' +
+      'Ensure the OTP email has arrived and the Gmail account matches the credentials.'
+    );
   }
 
   ctx.log(`Found ${messages.length} message(s). Scanning for OTP...`);
 
   // ── 5. Extract OTP from message body ──────────────────────────────────────
-  // Patterns ordered from most specific to most general
   const otpPatterns: RegExp[] = [
     /\b(?:OTP|one.?time.?password|verification.?code|passcode|security.?code|login.?code|your.?code)[^\d]{0,30}(\d{4,8})\b/i,
-    /\b(\d{6})\b/,   // 6-digit (most common)
-    /\b(\d{4})\b/,   // 4-digit
-    /\b(\d{8})\b/,   // 8-digit
+    /\b(\d{6})\b/,
+    /\b(\d{4})\b/,
+    /\b(\d{8})\b/,
   ];
 
   for (const message of messages) {
     const msgId = message.id!;
-
-    const msgResponse = await gmail.users.messages.get({
-      userId: 'me',
-      id: msgId,
-      format: 'full',
-    });
-
+    const msgResponse = await gmail.users.messages.get({ userId: 'me', id: msgId, format: 'full' });
     const payload = msgResponse.data.payload;
     if (!payload) continue;
 
@@ -192,13 +167,12 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
       const match = bodyText.match(pattern);
       if (match) {
         const otp = match[1] ?? match[0];
-        ctx.log(`OTP extracted: "${otp}" (matched pattern: ${pattern.source})`);
+        ctx.log(`OTP extracted: "${otp}" (pattern: ${pattern.source})`);
         ctx.setVariable(outputVar, otp);
         ctx.log(`Stored as runtime variable $[${outputVar}] = ${otp}`);
         return;
       }
     }
-
     ctx.warn(`No OTP pattern matched in message ${msgId}. Trying next...`);
   }
 
@@ -206,6 +180,137 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
     'Could not extract an OTP from any recent emails. ' +
     'Ensure the email arrived within the last 30 minutes and contains a numeric code.'
   );
+}
+
+// ── OAuth2 browser consent flow ─────────────────────────────────────────────
+// Spins up a temporary localhost HTTP server, opens the auth URL in the
+// system browser, waits for Google to redirect back with the auth code,
+// exchanges it for tokens, then shuts the server down.
+async function runLocalOAuthFlow(ctx: WalnutBaseContext, oauthCreds: any): Promise<any> {
+  const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes for user to complete consent
+
+  return new Promise<any>((resolve, reject) => {
+    // Pick a random available port in the 8080–9000 range
+    const port = Math.floor(Math.random() * 920) + 8080;
+    const redirectUri = `http://localhost:${port}`;
+
+    const oAuth2Client = new google.auth.OAuth2(
+      oauthCreds.client_id,
+      oauthCreds.client_secret,
+      redirectUri
+    );
+
+    const authUrl = oAuth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: ['https://www.googleapis.com/auth/gmail.readonly'],
+      prompt: 'consent',   // force refresh_token to always be returned
+    });
+
+    // Timeout guard
+    const timer = setTimeout(() => {
+      server.close();
+      reject(new Error(
+        `OAuth2 consent flow timed out after 3 minutes. ` +
+        `If the browser did not open, visit this URL manually:\n${authUrl}`
+      ));
+    }, TIMEOUT_MS);
+
+    const server = http.createServer(async (req, res) => {
+      try {
+        const parsed   = url.parse(req.url ?? '', true);
+        const code     = parsed.query.code as string | undefined;
+        const error    = parsed.query.error as string | undefined;
+
+        if (error) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end('<h2>Authorization denied.</h2><p>You can close this tab.</p>');
+          clearTimeout(timer);
+          server.close();
+          reject(new Error(`OAuth2 consent was denied by the user: ${error}`));
+          return;
+        }
+
+        if (!code) {
+          // Not the callback request (e.g. favicon) — ignore
+          res.writeHead(200);
+          res.end();
+          return;
+        }
+
+        // Exchange auth code for tokens
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(
+          '<h2 style="font-family:sans-serif;color:green">&#10003; Gmail access granted!</h2>' +
+          '<p style="font-family:sans-serif">You can close this tab and return to Walnut.</p>'
+        );
+
+        clearTimeout(timer);
+        server.close();
+
+        const { tokens } = await oAuth2Client.getToken(code);
+        ctx.log('OAuth2 consent completed. Tokens received.');
+        resolve(tokens);
+
+      } catch (err: any) {
+        clearTimeout(timer);
+        server.close();
+        reject(new Error(`Failed to exchange OAuth2 code for tokens: ${err.message}`));
+      }
+    });
+
+    server.listen(port, '127.0.0.1', async () => {
+      ctx.log(`OAuth2 redirect server listening on ${redirectUri}`);
+      ctx.log(`Opening browser for Gmail consent...`);
+      ctx.log(`Auth URL: ${authUrl}`);
+
+      // Dynamically import 'open' (ESM-only package)
+      try {
+        const openModule = await import('open');
+        const openFn = openModule.default ?? openModule;
+        await (openFn as Function)(authUrl);
+        ctx.log('Browser launched. Waiting for user to complete consent (timeout: 3 min)...');
+      } catch {
+        // 'open' failed — log the URL so user can open it manually
+        ctx.warn(
+          `Could not launch browser automatically. ` +
+          `Please open this URL manually:\n${authUrl}`
+        );
+      }
+    });
+
+    server.on('error', (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      if (err.code === 'EADDRINUSE') {
+        reject(new Error(`Port ${port} is in use. Please retry — a different port will be selected.`));
+      } else {
+        reject(new Error(`OAuth2 redirect server error: ${err.message}`));
+      }
+    });
+  });
+}
+
+// ── Helper: local-first file resolution ────────────────────────────────────
+async function resolveFile(ctx: WalnutBaseContext, input: string, label: string): Promise<string> {
+  const localPath = path.isAbsolute(input)
+    ? input
+    : path.resolve(process.cwd(), input);
+
+  if (fs.existsSync(localPath)) {
+    ctx.log(`${label}: using local file → ${localPath}`);
+    return localPath;
+  }
+
+  ctx.log(`${label}: not a local path — resolving as Walnut artifact "${input}"`);
+  const resolved = await ctx.resolveArtifact(input);
+  ctx.log(`${label}: artifact resolved → ${resolved}`);
+
+  if (!fs.existsSync(resolved)) {
+    throw new Error(
+      `${label} file could not be found: "${input}"\n` +
+      'Provide either a valid local file path or an active Walnut artifact name/ID.'
+    );
+  }
+  return resolved;
 }
 
 // ── Helper: recursively decode MIME parts into plain text ───────────────────
@@ -219,7 +324,6 @@ function extractTextFromPayload(payload: any): string {
 
     if ((mimeType === 'text/plain' || mimeType === 'text/html') && body?.data) {
       const decoded = Buffer.from(body.data, 'base64url').toString('utf-8');
-      // Strip HTML tags so OTP regexes match raw numbers only
       parts.push(mimeType === 'text/html' ? decoded.replace(/<[^>]*>/g, ' ') : decoded);
     }
 
