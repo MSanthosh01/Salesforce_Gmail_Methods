@@ -1,0 +1,13 @@
+{
+  "name": "walnut-methods",
+  "version": "1.0.0",
+  "description": "Walnut custom automation methods",
+  "private": true,
+  "dependencies": {
+    "googleapis": "^144.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.4.0"
+  }
+}
