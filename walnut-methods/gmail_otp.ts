@@ -1,4 +1,4 @@
-import type { WalnutBaseContext } from './walnut';
+import type { WalnutWebContext } from './walnut';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
@@ -10,11 +10,11 @@ import type { Auth } from 'googleapis';
  * name: Read OTP from Gmail
  * description: Fetch the latest otp from gmail using client secret ${clientSecretPath} and token ${tokenPath} and store in $[OTP]
  * actionType: custom_read_otp_gmail
- * context: shared
+ * context: web
  * needsLocator: false
  * category: Email Automation
  */
-export async function readOtpFromGmail(ctx: WalnutBaseContext) {
+export async function readOtpFromGmail(ctx: WalnutWebContext) {
   // ctx.args[0] = clientSecretPath  — local path OR Walnut artifact name/ID
   //                                    e.g. "C:\...\client_secret.json"  or  "gmail-client-secret"
   // ctx.args[1] = tokenPath          — local path OR Walnut artifact name/ID for token.json
@@ -186,7 +186,7 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
 // Spins up a temporary localhost HTTP server, opens the auth URL in the
 // system browser, waits for Google to redirect back with the auth code,
 // exchanges it for tokens, then shuts the server down.
-async function runLocalOAuthFlow(ctx: WalnutBaseContext, oauthCreds: any): Promise<any> {
+async function runLocalOAuthFlow(ctx: WalnutWebContext, oauthCreds: any): Promise<any> {
   const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes for user to complete consent
 
   return new Promise<any>((resolve, reject) => {
@@ -263,18 +263,12 @@ async function runLocalOAuthFlow(ctx: WalnutBaseContext, oauthCreds: any): Promi
       ctx.log(`Opening browser for Gmail consent...`);
       ctx.log(`Auth URL: ${authUrl}`);
 
-      // Dynamically import 'open' (ESM-only package)
+      // Navigate Walnut's browser directly to the auth URL
       try {
-        const openModule = await import('open');
-        const openFn = openModule.default ?? openModule;
-        await (openFn as Function)(authUrl);
-        ctx.log('Browser launched. Waiting for user to complete consent (timeout: 3 min)...');
-      } catch {
-        // 'open' failed — log the URL so user can open it manually
-        ctx.warn(
-          `Could not launch browser automatically. ` +
-          `Please open this URL manually:\n${authUrl}`
-        );
+        await ctx.navigate(authUrl);
+        ctx.log('Walnut browser navigated to Google consent screen. Waiting for user to approve (timeout: 3 min)...');
+      } catch (navErr: any) {
+        ctx.warn(`Could not navigate Walnut browser: ${navErr.message}. Open this URL manually:\n${authUrl}`);
       }
     });
 
@@ -290,7 +284,7 @@ async function runLocalOAuthFlow(ctx: WalnutBaseContext, oauthCreds: any): Promi
 }
 
 // ── Helper: local-first file resolution ────────────────────────────────────
-async function resolveFile(ctx: WalnutBaseContext, input: string, label: string): Promise<string> {
+async function resolveFile(ctx: WalnutWebContext, input: string, label: string): Promise<string> {
   const localPath = path.isAbsolute(input)
     ? input
     : path.resolve(process.cwd(), input);
