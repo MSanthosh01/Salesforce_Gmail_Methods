@@ -27,16 +27,28 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   }
 
   // ── 1. Load & validate credential file ────────────────────────────────────
-  // ctx.resolveArtifact handles both cases transparently:
-  //   • Walnut artifact name/ID  → downloads the artifact and returns its local path
-  //   • Local file path          → returns the path as-is (absolute or relative to cwd)
+  // Detect whether the input is a local file path or a Walnut artifact reference:
+  //   • If the path exists on disk (absolute or relative) → use it directly
+  //   • Otherwise → treat it as a Walnut artifact name/ID and resolve via ctx.resolveArtifact
   ctx.log(`Resolving credential source: "${credentialFilePath}"`);
-  const resolvedPath = await ctx.resolveArtifact(credentialFilePath);
-  ctx.log(`Credential file resolved to: ${resolvedPath}`);
+
+  const localPath = path.isAbsolute(credentialFilePath)
+    ? credentialFilePath
+    : path.resolve(process.cwd(), credentialFilePath);
+
+  let resolvedPath: string;
+  if (fs.existsSync(localPath)) {
+    resolvedPath = localPath;
+    ctx.log(`Using local file: ${resolvedPath}`);
+  } else {
+    ctx.log(`Local file not found — treating as Walnut artifact: "${credentialFilePath}"`);
+    resolvedPath = await ctx.resolveArtifact(credentialFilePath);
+    ctx.log(`Artifact resolved to: ${resolvedPath}`);
+  }
 
   if (!fs.existsSync(resolvedPath)) {
     throw new Error(
-      `Credential file not found after resolution: ${resolvedPath}\n` +
+      `Credential file not found: "${credentialFilePath}"\n` +
       'Provide either a valid local file path or a Walnut artifact name/ID.'
     );
   }
