@@ -1,0 +1,9 @@
+# Logs
+*.log
+
+# Node
+walnut-methods/node_modules/
+walnut-methods/dist/
+
+# Temp files copied for debugging
+walnut-agent*.log
