@@ -118,8 +118,8 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
     `OR subject:"login code" OR subject:"signin code" ` +
     `OR subject:"Verification Code" OR subject:"verification")`;
 
-  // Pass 1 — unread OTP emails (no time limit, catches emails marked unread manually)
-  const unreadQuery = `in:inbox is:unread ${otpSubjectFilter}`;
+  // Pass 1 — recent unread OTP emails (last 30 min, catches emails marked unread manually)
+  const unreadQuery = `in:inbox is:unread after:${thirtyMinutesAgo} ${otpSubjectFilter}`;
   ctx.log(`Searching Gmail (unread OTP emails): ${unreadQuery}`);
   const unreadResponse = await gmail.users.messages.list({
     userId: 'me',
