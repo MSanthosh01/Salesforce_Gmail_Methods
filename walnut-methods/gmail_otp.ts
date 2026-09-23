@@ -1,4 +1,5 @@
-import type { WalnutWebContext } from './walnut';
+import type { WalnutBaseContext } from './walnut';
+import { exec } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
@@ -10,11 +11,11 @@ import type { Auth } from 'googleapis';
  * name: Read OTP from Gmail
  * description: Fetch the latest otp from gmail using client secret ${clientSecretPath} and token ${tokenPath} and store in $[OTP]
  * actionType: custom_read_otp_gmail
- * context: web
+ * context: shared
  * needsLocator: false
  * category: Email Automation
  */
-export async function readOtpFromGmail(ctx: WalnutWebContext) {
+export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   // ctx.args[0] = clientSecretPath  — local path OR Walnut artifact name/ID
   //                                    e.g. "C:\...\client_secret.json"  or  "gmail-client-secret"
   // ctx.args[1] = tokenPath          — local path OR Walnut artifact name/ID for token.json
@@ -186,7 +187,7 @@ export async function readOtpFromGmail(ctx: WalnutWebContext) {
 // Spins up a temporary localhost HTTP server, opens the auth URL in the
 // system browser, waits for Google to redirect back with the auth code,
 // exchanges it for tokens, then shuts the server down.
-async function runLocalOAuthFlow(ctx: WalnutWebContext, oauthCreds: any): Promise<any> {
+async function runLocalOAuthFlow(ctx: WalnutBaseContext, oauthCreds: any): Promise<any> {
   const TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes for user to complete consent
 
   return new Promise<any>((resolve, reject) => {
@@ -263,13 +264,17 @@ async function runLocalOAuthFlow(ctx: WalnutWebContext, oauthCreds: any): Promis
       ctx.log(`Opening browser for Gmail consent...`);
       ctx.log(`Auth URL: ${authUrl}`);
 
-      // Navigate Walnut's browser directly to the auth URL
-      try {
-        await ctx.navigate(authUrl);
-        ctx.log('Walnut browser navigated to Google consent screen. Waiting for user to approve (timeout: 3 min)...');
-      } catch (navErr: any) {
-        ctx.warn(`Could not navigate Walnut browser: ${navErr.message}. Open this URL manually:\n${authUrl}`);
-      }
+      // Open system browser for OAuth consent
+      const openCmd = process.platform === 'win32'
+        ? `start "" "${authUrl}"`
+        : process.platform === 'darwin'
+          ? `open "${authUrl}"`
+          : `xdg-open "${authUrl}"`;
+
+      exec(openCmd, (err) => {
+        if (err) ctx.warn(`Could not open system browser: ${err.message}. Open this URL manually:\n${authUrl}`);
+        else ctx.log('System browser opened for Gmail consent. Waiting for user to approve (timeout: 3 min)...');
+      });
     });
 
     server.on('error', (err: NodeJS.ErrnoException) => {
@@ -284,7 +289,7 @@ async function runLocalOAuthFlow(ctx: WalnutWebContext, oauthCreds: any): Promis
 }
 
 // ── Helper: local-first file resolution ────────────────────────────────────
-async function resolveFile(ctx: WalnutWebContext, input: string, label: string): Promise<string> {
+async function resolveFile(ctx: WalnutBaseContext, input: string, label: string): Promise<string> {
   const localPath = path.isAbsolute(input)
     ? input
     : path.resolve(process.cwd(), input);
