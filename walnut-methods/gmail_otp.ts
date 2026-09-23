@@ -112,23 +112,39 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   const tenMinutesAgo    = Math.floor((Date.now() - 10 * 60 * 1000) / 1000);
   const thirtyMinutesAgo = Math.floor((Date.now() - 30 * 60 * 1000) / 1000);
 
-  const defaultQuery =
-    `in:inbox after:${tenMinutesAgo} ` +
+  const otpSubjectFilter =
     `(subject:OTP OR subject:"one-time" OR subject:"verification code" ` +
     `OR subject:"passcode" OR subject:"your code" OR subject:"security code" ` +
-    `OR subject:"login code" OR subject:"signin code")`;
+    `OR subject:"login code" OR subject:"signin code" ` +
+    `OR subject:"Verification Code" OR subject:"verification")`;
 
-  ctx.log(`Searching Gmail (last 10 min, OTP keywords): ${defaultQuery}`);
-
-  const listResponse = await gmail.users.messages.list({
+  // Pass 1 — unread OTP emails (no time limit, catches emails marked unread manually)
+  const unreadQuery = `in:inbox is:unread ${otpSubjectFilter}`;
+  ctx.log(`Searching Gmail (unread OTP emails): ${unreadQuery}`);
+  const unreadResponse = await gmail.users.messages.list({
     userId: 'me',
-    q: defaultQuery,
+    q: unreadQuery,
     maxResults: 5,
   });
 
-  let messages = listResponse.data.messages;
+  // Pass 2 — recent OTP emails (last 10 min, read or unread)
+  const recentQuery = `in:inbox after:${tenMinutesAgo} ${otpSubjectFilter}`;
+  ctx.log(`Searching Gmail (last 10 min, OTP keywords): ${recentQuery}`);
+  const recentResponse = await gmail.users.messages.list({
+    userId: 'me',
+    q: recentQuery,
+    maxResults: 5,
+  });
 
-  if (!messages || messages.length === 0) {
+  // Merge: unread first, then recent, deduplicated
+  const seen = new Set<string>();
+  let messages: Array<{ id?: string | null; threadId?: string | null }> = [];
+  for (const m of [...(unreadResponse.data.messages ?? []), ...(recentResponse.data.messages ?? [])]) {
+    if (m.id && !seen.has(m.id)) { seen.add(m.id); messages.push(m); }
+  }
+
+  if (messages.length === 0) {
+    // Pass 3 — broad fallback: all inbox mail last 30 min
     const fallbackQuery = `in:inbox after:${thirtyMinutesAgo}`;
     ctx.warn(`No OTP keyword match. Falling back to all inbox mail (last 30 min): ${fallbackQuery}`);
     const fallbackResponse = await gmail.users.messages.list({
@@ -149,12 +165,23 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   ctx.log(`Found ${messages.length} message(s). Scanning for OTP...`);
 
   // ── 5. Extract OTP from message body ──────────────────────────────────────
-  const otpPatterns: RegExp[] = [
-    /\b(?:OTP|one.?time.?password|verification.?code|passcode|security.?code|login.?code|your.?code)[^\d]{0,30}(\d{4,8})\b/i,
-    /\b(\d{6})\b/,
-    /\b(\d{4})\b/,
-    /\b(\d{8})\b/,
+  // Patterns ordered by confidence — contextual match first, then digit-length specificity.
+  // The loose \b(\d{4})\b pattern is intentionally last and skipped if a better match exists.
+  const otpPatterns: Array<{ re: RegExp; label: string; confident: boolean }> = [
+    // Contextual: OTP label followed by any-length digit code
+    { re: /\b(?:OTP|one.?time.?password|verification.?code|passcode|security.?code|login.?code|your.?code|Verification.?Code)[^\d]{0,60}(\d{4,10})\b/i, label: 'contextual', confident: true },
+    // Standalone digit codes by length (most specific first)
+    { re: /\b(\d{8})\b/, label: '8-digit', confident: true },
+    { re: /\b(\d{7})\b/, label: '7-digit', confident: true },
+    { re: /\b(\d{6})\b/, label: '6-digit', confident: true },
+    { re: /\b(\d{5})\b/, label: '5-digit', confident: true },
+    // 4-digit: exclude years (19xx / 20xx) — low confidence, used only as last resort
+    { re: /\b(?!(?:19|20)\d{2}\b)(\d{4})\b/, label: '4-digit (non-year)', confident: false },
   ];
+
+  // Collect best candidate across all messages before committing
+  let bestOtp: string | null = null;
+  let bestConfident = false;
 
   for (const message of messages) {
     const msgId = message.id!;
@@ -165,17 +192,27 @@ export async function readOtpFromGmail(ctx: WalnutBaseContext) {
     const bodyText = extractTextFromPayload(payload);
     ctx.log(`Message ${msgId} preview: ${bodyText.substring(0, 200).replace(/\s+/g, ' ')}`);
 
-    for (const pattern of otpPatterns) {
-      const match = bodyText.match(pattern);
+    for (const { re, label, confident } of otpPatterns) {
+      const match = bodyText.match(re);
       if (match) {
         const otp = match[1] ?? match[0];
-        ctx.log(`OTP extracted: "${otp}" (pattern: ${pattern.source})`);
-        ctx.setVariable(outputVar, otp);
-        ctx.log(`Stored as runtime variable $[${outputVar}] = ${otp}`);
-        return;
+        ctx.log(`OTP candidate: "${otp}" (pattern: ${label}) from message ${msgId}`);
+        if (!bestOtp || (!bestConfident && confident)) {
+          bestOtp = otp;
+          bestConfident = confident;
+        }
+        if (confident) break; // confident match in this message — no need to try weaker patterns
       }
     }
-    ctx.warn(`No OTP pattern matched in message ${msgId}. Trying next...`);
+
+    if (bestConfident) break; // found a high-confidence OTP — stop scanning further messages
+  }
+
+  if (bestOtp) {
+    ctx.log(`OTP extracted: "${bestOtp}"`);
+    ctx.setVariable(outputVar, bestOtp);
+    ctx.log(`Stored as runtime variable $[${outputVar}] = ${bestOtp}`);
+    return;
   }
 
   throw new Error(
