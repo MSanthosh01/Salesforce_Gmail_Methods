@@ -14,6 +14,7 @@ import type { Auth } from 'googleapis';
  * context: shared
  * needsLocator: false
  * category: Email Automation
+ * modules: child_process
  */
 export async function readOtpFromGmail(ctx: WalnutBaseContext) {
   // ctx.args[0] = clientSecretPath  — local path OR Walnut artifact name/ID
