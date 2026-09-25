@@ -304,12 +304,20 @@ async function resolveFile(ctx: WalnutBaseContext, input: string, label: string)
   const resolved = await ctx.resolveArtifact(input);
   ctx.log(`${label}: artifact resolved → ${resolved}`);
 
-  if (!fs.existsSync(resolved)) {
-    throw new Error(
-      `${label} file could not be found: "${input}"\n` +
-      'Provide either a valid local file path or an active Walnut artifact name/ID.'
-    );
+  // resolveArtifact may return the destination path before the download completes.
+  // Retry up to 5 times (5 seconds total) before giving up.
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    if (fs.existsSync(resolved)) break;
+    if (attempt === 5) {
+      throw new Error(
+        `${label} artifact "${input}" was resolved to "${resolved}" but the file was not present ` +
+        `after 5 retries.\nCheck that the artifact is still active and your Walnut Agent has network access.`
+      );
+    }
+    ctx.warn(`${label}: file not ready yet (attempt ${attempt}/5) — retrying in 1s...`);
+    await new Promise(resolve => setTimeout(resolve, 1000));
   }
+
   return resolved;
 }
 
